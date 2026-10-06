@@ -322,7 +322,7 @@ open config-generator.html
 | 重试延迟 | `RETRY_DELAY` | `5-15` | 重试间隔（秒） |
 | 频率限制 | `RATE_LIMIT` | `10` | 请求频率（次/分钟） |
 
-> **提示**：`RATE_LIMIT` 现在会在内部以异步速率限制器落实到每一次 API 调用，`RETRY_DELAY` 则作为指数退避区间使用。合理配置这两个参数可以在稳定性与速度之间取得平衡，避免在长时间守护进程中被判定为异常流量。
+> **提示**：`RATE_LIMIT` 通过异步速率限制器控制常规 API 调用间隔。扫码模式的登录 UID 获取与确认长轮询不受阅读限速影响，避免二维码显示后后台延迟监听；阅读请求仍保持限速。`RETRY_DELAY` 控制原 cURL HTTP 客户端的重试等待区间。
 
 ### Hack配置
 
@@ -559,6 +559,28 @@ notification:
 | 守护进程开关 | `DAEMON_ENABLED` | `false` | 是否启用守护进程 |
 | 会话间隔 | `SESSION_INTERVAL` | `120-180` | 会话间隔时间（分钟） |
 | 每日最大会话数 | `MAX_DAILY_SESSIONS` | `12` | 每日最大执行次数 |
+| 每日首场时间 | `DAEMON_DAILY_START_TIME` | 空 | `daemon.daily_start_time`，例如 `05:00`；使用 `schedule.timezone` |
+
+设置 `daily_start_time: "05:00"` 后，首场在配置时区的 05:00 开始；如果启动时已经错过首场且当天还没执行，会补跑。后续间隔从上一场结束时随机计算，达到每日上限后等待次日首场时间；跨日的休息计划也转到新一天的首场时间。扫码模式会持久化每日次数及已抽取的下一场时间，重启不会重新抽取正在等待的间隔。启动一次会话即计一次，失败或中断也占用每日次数。
+
+例如每天最早 05:00，每场 60～90 分钟，结束后休息 120～180 分钟，每日最多 3 次：
+
+```yaml
+app:
+  startup_mode: daemon
+reading:
+  target_duration: "60-90"
+schedule:
+  enabled: false
+  timezone: Asia/Shanghai
+daemon:
+  enabled: true
+  daily_start_time: "05:00"
+  session_interval: "120-180"
+  max_daily_sessions: 3
+```
+
+使用 YAML 配置时，应挂载 `./config.yaml:/app/config.yaml:ro`，并移除 Compose 中覆盖这些参数的 `STARTUP_MODE`、`TARGET_DURATION`、`CRON_EXPRESSION` 等环境变量映射，以免旧的一分钟验收参数优先于新配置。
 
 ## 运行模式详解
 
@@ -779,6 +801,59 @@ curl_config:
 ```
 
 ## Docker部署
+
+### 扫码登录部署（本 fork）
+
+扫码模式支持一个账号，首次也不需要 cURL：打开管理页面，用微信扫码确认，必要时输入手机显示的四位验证码，再从书架选择一本书。之后 Cookie 失效时只需重新扫码；凭据保存后会立即恢复一次阅读，并继续已有的定时或守护策略。
+
+在本仓库目录创建本地 `.env` 文件（不要提交），设置：
+
+```dotenv
+WEB_PUBLIC_URL=https://read.example.com
+WEB_ADMIN_PASSWORD=请替换为自己生成的至少16字符随机密码
+```
+
+`WEB_PUBLIC_URL` 必须是实际 HTTPS 站点的根地址，不能带路径、查询参数或登录信息。可用 `python -c "import secrets; print(secrets.token_urlsafe(24))"` 在自己的终端生成管理密码。
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
+
+仓库中的 Compose 从当前 fork 构建 `weread-bot:local`，容器名为 `weread-bot-qr`。它只将端口映射到宿主机 `127.0.0.1:8080`，请将 HTTPS 反向代理指向该地址。例如，已配置证书的 Nginx 站点中使用：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+}
+```
+
+若反向代理也在容器内，应加入同一 Docker 网络并代理到 `weread-bot:8080`，不用将管理端口暴露到公网。代理需保留浏览器原始 `Origin`，不要把它改成上游 HTTP 地址。管理登录 Cookie 仅通过 HTTPS 发送，直接打开 HTTP 端口不能完成管理登录。
+
+管理页面中的“登录”是本地管理密码，“微信扫码”才是微信读书授权。扫码成功后点击“加载书架”，选择一本可读书籍并保存；程序读取该书已有进度，没有进度时从首个正文章节开始。书架为空时，先在微信读书中添加书籍再刷新。更换选书会停止当前会话并启动新会话。
+
+默认示例为北京时间每两小时整点执行。首次选书和重新扫码会立即额外触发一次，与同时到达的计划触发合并；守护模式仍受每日会话次数上限约束。扫码模式下 `immediate` 阅读一次后管理页面继续运行。首次没有登录或尚未选书时，容器保持运行等待操作。
+
+**使用已有配置：** 先在 `compose.yaml` 中取消 `config.yaml` 挂载行的注释，并确认文件存在。按原配置设置 `.env` 中的 `STARTUP_MODE` 和 `CRON_EXPRESSION`；Compose 的环境变量优先于 YAML。使用守护模式时在 YAML 设置 `daemon.enabled: true`，并保留原有会话间隔、每日上限和通知配置。扫码模式的账号和书籍来自页面，不读取 `curl_config` 和 `reading.books`。
+
+| 配置 | 环境变量 | 默认值 / 说明 |
+| --- | --- | --- |
+| `auth.mode` | `AUTH_MODE` | `curl`；设置 `qr` 启动单账号扫码管理 |
+| `auth.state_file` | `AUTH_STATE_FILE` | `data/auth.json`；独立凭据与选书状态 |
+| `web.host` | `WEB_HOST` | `127.0.0.1`；容器内部使用 `0.0.0.0` |
+| `web.port` | `WEB_PORT` | `8080` |
+| `web.public_url` | `WEB_PUBLIC_URL` | 必填 HTTPS 根地址，也是失效提醒中的入口 |
+| 无（仅环境变量） | `WEB_ADMIN_PASSWORD` | 必填，至少 16 字符；管理会话有效期 8 小时 |
+
+**保存与恢复：** `./data:/app/data` 必须是整个可写目录；凭据更新采用原子文件替换，不要只挂载一个只读 JSON 文件。Cookie 续期结果、设备标识和选书会自动保存，重建容器后继续使用。备份整个 `data/` 目录即可恢复，但其中包含登录凭据，应按密码文件保管。程序只允许重新登录已绑定的同一个微信账号；如需更换账号，停止容器，将原 `data/auth.json` 移到安全备份位置后再启动并重新扫码。
+
+**失效处理：** 确认认证失效后暂停阅读，通过已有通知通道提醒一次；网络故障单独报告。二维码过期、验证码错误都可以在页面重新操作。页面不会显示 Cookie 或 Token；如上游改变响应结构，会提示协议不兼容，不会自动改用浏览器或要求复制 cURL。
+
+**离线自检：** `--validate-config` 和 `--dry-run` 只检查本地配置，不创建二维码、不访问微信读书，也不证明登录仍然有效。
+
+**回退原模式：** 将 `AUTH_MODE` 改为 `curl`，恢复原有 cURL 配置后重新创建容器；原 cURL 单账号、多账号及命令行行为保留。切换环境变量需要 `docker compose up -d`，单纯 `restart` 不更新容器环境。扫码凭据文件不会覆盖原 cURL 文件。
 
 ### 运行
 

@@ -11,6 +11,19 @@ app:
   # 多用户时最大并发数；1=顺序执行，2+=同时执行多用户（示例：1、2、3）
   max_concurrent_users: 1
 
+# 登录来源：默认 curl 保持原有行为；qr 为单账号直接扫码，首次也无需抓包。
+auth:
+  mode: "curl"                  # 环境变量 AUTH_MODE
+  state_file: "data/auth.json"   # AUTH_STATE_FILE；应挂载整个可写目录，勿提交凭据
+
+# 仅 auth.mode=qr 时启动管理页面；无需配置 curl_config 或 reading.books。
+# 管理密码只从 WEB_ADMIN_PASSWORD 环境变量读取，至少 16 字符。
+# 页面必须经 HTTPS 访问；public_url 是站点根地址，不带路径或查询参数。
+web:
+  host: "127.0.0.1"             # WEB_HOST；容器内部使用 0.0.0.0
+  port: 8080                    # WEB_PORT
+  public_url: ""                # WEB_PUBLIC_URL，例如 https://read.example.com
+
 # CURL 配置（支持单用户和多用户模式）
 curl_config:
   # 单用户模式：从文件读取 CURL bash 命令。多用户模式下此项无效；若同时配置单用户与多用户，优先多用户。
@@ -95,7 +108,8 @@ network:
   timeout: 30           # HTTP 请求超时时间（秒），示例：15、30、60
   retry_times: 3        # 请求失败后的重试次数，示例：2、3、5
   retry_delay: "5-15"   # 重试延迟（秒），支持区间如 "5-15"，将在退避中使用
-  # 请求频率控制（请求/分钟），会被速率限制器严格执行；示例：10 表示每分钟最多 10 次请求
+  # 阅读等常规请求频率控制（请求/分钟）；扫码 UID/确认长轮询独立，不受此限制
+  # 示例：10 表示常规请求间隔至少 6 秒
   rate_limit: 10
 
 # 通知配置
@@ -258,6 +272,10 @@ daemon:
   session_interval: "120-180"
   # 每日最多执行的会话次数，防止过度请求；示例：8、12、24
   max_daily_sessions: 12
+  # 每天首场最早开始时间（HH:MM），使用 schedule.timezone；空值保留全天模式
+  # 例如 "05:00"：5点前等待，错过后启动补跑；达到上限后等次日5点
+  # 扫码模式保存已抽取的下一场时间，重启后继续等待；间隔从上一场结束计算
+  daily_start_time: ""    # 环境变量 DAEMON_DAILY_START_TIME
 
 # 日志配置
 logging:

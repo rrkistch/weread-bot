@@ -42,6 +42,8 @@ class JsonLoggingTests(unittest.TestCase):
             logging.info('中文 "quoted"\nline')
             for handler in logging.getLogger().handlers:
                 handler.flush()
+                handler.close()
+            logging.getLogger().handlers.clear()
 
             lines = log_path.read_text(encoding="utf-8").splitlines()
 

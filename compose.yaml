@@ -1,0 +1,31 @@
+services:
+  weread-bot:
+    build: .
+    image: weread-bot:local
+    container_name: weread-bot-qr
+    environment:
+      AUTH_MODE: qr
+      AUTH_STATE_FILE: /app/data/auth.json
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8080"
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:?Set WEB_PUBLIC_URL to your HTTPS origin}
+      WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:?Set WEB_ADMIN_PASSWORD in .env}
+      STARTUP_MODE: ${STARTUP_MODE:-scheduled}
+      SCHEDULE_ENABLED: "true"
+      CRON_EXPRESSION: ${CRON_EXPRESSION:-0 */2 * * *}
+      TIMEZONE: Asia/Shanghai
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # 使用现有配置时先确保文件存在，再取消下一行注释。
+      # - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

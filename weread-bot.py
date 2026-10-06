@@ -53,12 +53,18 @@ import argparse
 import tempfile
 import traceback
 import uuid
+import copy
+import hmac
+import secrets
+import io
+from http.cookies import SimpleCookie, CookieError
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set, Union, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 
@@ -82,6 +88,17 @@ try:
 except ImportError:
     croniter = None
 from zoneinfo import ZoneInfo
+
+try:
+    from aiohttp import web
+except ImportError:
+    web = None
+
+try:
+    import qrcode
+    import qrcode.image.svg
+except ImportError:
+    qrcode = None
 
 VERSION = "0.3.10"
 REPO = "https://github.com/funnyzak/weread-bot"
@@ -156,6 +173,8 @@ def log_context(user: str, session_id: Optional[str] = None):
 SENSITIVE_LOG_KEYS = {
     "authorization", "cookie", "cookies", "wr_skey", "token", "bot_token",
     "webhook_url", "secret", "ps", "pc", "sendkey", "pushkey", "device_key",
+    "uid", "otp", "accesstoken", "refreshtoken", "wr_rt", "wr_vid",
+    "wr_fp", "password", "admin_password", "csrf", "skey", "x-skey",
 }
 SENSITIVE_LOG_KEY_PATTERN = "|".join(
     sorted((re.escape(key) for key in SENSITIVE_LOG_KEYS), key=len, reverse=True)
@@ -181,9 +200,15 @@ def redact_for_log(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact_for_log(item) for item in value]
     if isinstance(value, str):
+        value = re.sub(
+            r"https?://[^\s\"'<>]+",
+            lambda match: safe_url_for_log(match.group(0))
+            if "?" in match.group(0) else match.group(0),
+            value,
+        )
         redacted = re.sub(
             (
-                rf"(?i)(?P<prefix>[\"']?(?:{SENSITIVE_LOG_KEY_PATTERN})"
+                rf"(?i)(?<![\w-])(?P<prefix>[\"']?(?:{SENSITIVE_LOG_KEY_PATTERN})"
                 r"[\"']?\s*[:=]\s*)"
                 r"(?P<quote>[\"']?)(?P<secret>.*?)(?P=quote)"
                 r"(?=\s*[,;}\]]|\s*$)"
@@ -382,6 +407,37 @@ class DaemonConfig:
     enabled: bool = False
     session_interval: str = "120-180"  # 会话间隔（分钟）
     max_daily_sessions: int = 12  # 每日最大会话数
+    daily_start_time: str = ""  # 可选 HH:MM；错过后补跑，空值保留全天模式
+
+
+def daemon_day_start(
+    now: datetime,
+    start_time: str,
+    days: int = 0,
+) -> datetime:
+    """按 now 的时区计算当天或次日首场时间。"""
+    hour, minute = map(int, (start_time or "00:00").split(":"))
+    return (now + timedelta(days=days)).replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def daemon_interval_start(
+    now: datetime,
+    minutes: float,
+    start_time: str,
+) -> datetime:
+    """结束后计休息时间；跨日则转到新一天的首场时间。"""
+    candidate = now + timedelta(minutes=minutes)
+    if not start_time:
+        return candidate
+    anchor = daemon_day_start(candidate, start_time)
+    if candidate.date() != now.date():
+        return anchor
+    return max(candidate, anchor)
 
 
 @dataclass
@@ -466,6 +522,22 @@ class HackConfig:
 
 
 @dataclass
+class AuthConfig:
+    """登录凭据来源；默认保留原有 cURL 行为。"""
+    mode: str = "curl"
+    state_file: str = "data/auth.json"
+
+
+@dataclass
+class WebConfig:
+    """扫码管理入口，TLS 由反向代理终止。"""
+    host: str = "127.0.0.1"
+    port: int = 8080
+    public_url: str = ""
+    admin_password: str = field(default="", repr=False)
+
+
+@dataclass
 class WeReadConfig:
     """微信读书配置主类"""
     # App 基本配置
@@ -496,6 +568,8 @@ class WeReadConfig:
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 
     def get_startup_info(self) -> str:
         """获取启动信息摘要"""
@@ -562,6 +636,11 @@ class WeReadConfig:
                 f"\n🔄 守护进程: 会话间隔 {self.daemon.session_interval} 分钟，"
                 f"每日最大 {self.daemon.max_daily_sessions} 次会话"
             )
+            if self.daemon.daily_start_time:
+                startup_info += (
+                    f"，每日首场最早 {self.daemon.daily_start_time}"
+                    f" ({self.schedule.timezone})"
+                )
 
         return startup_info
 
@@ -584,7 +663,9 @@ class WeReadConfig:
         return mode_map.get(self.reading.mode.lower(), self.reading.mode)
 
     def _get_curl_source_desc(self) -> str:
-        """获取CURL数据源描述"""
+        """获取登录凭据来源描述。"""
+        if self.auth.mode == "qr":
+            return "扫码登录（独立持久化凭据）"
         if self.curl_file_path:
             return f"文件: {self.curl_file_path}"
         elif self.curl_content:
@@ -856,6 +937,10 @@ def parse_choice(value: Any, path: str, choices: Set[str]) -> str:
 
 def validate_config_semantics(config: WeReadConfig) -> None:
     """集中校验加载后的全局配置和用户覆盖。"""
+    config.auth.mode = parse_choice(config.auth.mode, "auth.mode", {"curl", "qr"})
+    config.web.port = parse_int(config.web.port, "web.port", 1)
+    if config.web.port > 65535:
+        raise ConfigError("web.port 必须在 1 到 65535 之间")
     config.startup_mode = parse_choice(
         config.startup_mode,
         "app.startup_mode",
@@ -919,6 +1004,16 @@ def validate_config_semantics(config: WeReadConfig) -> None:
     )
     parse_range(config.daemon.session_interval, "daemon.session_interval", 0)
     parse_int(config.daemon.max_daily_sessions, "daemon.max_daily_sessions", 1)
+    daily_start = config.daemon.daily_start_time
+    if not isinstance(daily_start, str) or (
+        daily_start and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", daily_start)
+    ):
+        raise ConfigError("daemon.daily_start_time 必须为空或 HH:MM 格式时间")
+    if daily_start:
+        try:
+            ZoneInfo(config.schedule.timezone or "Asia/Shanghai")
+        except (ValueError, KeyError):
+            raise ConfigError("schedule.timezone 必须是有效时区") from None
     config.logging.level = parse_choice(
         config.logging.level,
         "logging.level",
@@ -1169,6 +1264,10 @@ class ConfigManager:
                 config_data, "daemon.max_daily_sessions",
                 "MAX_DAILY_SESSIONS", "12"
             ), "daemon.max_daily_sessions", 1),
+            daily_start_time=self._get_config_value(
+                config_data, "daemon.daily_start_time",
+                "DAEMON_DAILY_START_TIME", "",
+            ),
         )
 
         # 加载日志配置
@@ -1213,6 +1312,22 @@ class ConfigManager:
             ),
         )
 
+        config.auth = AuthConfig(
+            mode=self._get_config_value(config_data, "auth.mode", "AUTH_MODE", "curl"),
+            state_file=self._get_config_value(
+                config_data, "auth.state_file", "AUTH_STATE_FILE", "data/auth.json"
+            ),
+        )
+        config.web = WebConfig(
+            host=self._get_config_value(config_data, "web.host", "WEB_HOST", "127.0.0.1"),
+            port=parse_int(self._get_config_value(
+                config_data, "web.port", "WEB_PORT", "8080"
+            ), "web.port", 1),
+            public_url=str(self._get_config_value(
+                config_data, "web.public_url", "WEB_PUBLIC_URL", ""
+            )).rstrip("/"),
+            admin_password=os.getenv("WEB_ADMIN_PASSWORD", ""),
+        )
         validate_config_semantics(config)
         return config
 
@@ -1829,6 +1944,8 @@ class CurlParser:
 
 def classify_runtime_error(exc: Exception) -> RuntimeErrorCategory:
     """对运行时错误进行统一分类"""
+    if isinstance(exc, QRServiceError):
+        return exc.category
     network_error_types: List[type] = [TimeoutError, ConnectionError]
     if requests is not None:
         network_error_types.append(requests.RequestException)
@@ -2961,6 +3078,9 @@ class WeReadApplication:
         logging.info(f"📡 收到信号 {signum}，准备优雅关闭...")
         self.shutdown_signal = signum
         self._shutdown_event.set()
+        runtime = getattr(self, "_qr_runtime", None)
+        if runtime is not None and runtime.active_task is not None:
+            runtime.active_task.cancel()
 
     def is_shutdown_requested(self) -> bool:
         """返回当前应用实例是否收到关闭请求。"""
@@ -2968,6 +3088,9 @@ class WeReadApplication:
 
     async def run(self) -> RunResult:
         """根据配置的启动模式运行应用程序"""
+        if self.config.auth.mode == "qr":
+            self._qr_runtime = QRRuntime(self)
+            return await self._qr_runtime.run()
         startup_mode = StartupMode(self.config.startup_mode.lower())
 
         if startup_mode == StartupMode.IMMEDIATE:
@@ -3065,9 +3188,18 @@ class WeReadApplication:
         last_result = RunResult(
             final_status="cancelled", user_count=0, cancelled_users=0
         )
+        daily_start = self.config.daemon.daily_start_time
+        zone = ZoneInfo(self.config.schedule.timezone) if daily_start else None
         while not self.is_shutdown_requested():
+            now = datetime.now(zone) if zone else datetime.now()
+            if daily_start and now < daemon_day_start(now, daily_start):
+                await interruptible_sleep(
+                    (daemon_day_start(now, daily_start) - now).total_seconds(),
+                    self.is_shutdown_requested,
+                )
+                continue
             # 检查每日会话限制
-            current_date = datetime.now().date()
+            current_date = now.date()
             if WeReadApplication._last_session_date != current_date:
                 WeReadApplication._daily_session_count = 0
                 WeReadApplication._last_session_date = current_date
@@ -3102,8 +3234,12 @@ class WeReadApplication:
                     f"😴 守护进程等待 {interval_minutes:g} "
                     "分钟后执行下一次会话..."
                 )
+                now = datetime.now(zone) if zone else datetime.now()
+                next_start = daemon_interval_start(
+                    now, interval_minutes, daily_start,
+                )
                 await interruptible_sleep(
-                    interval_minutes * 60,
+                    (next_start - now).total_seconds(),
                     self.is_shutdown_requested,
                 )
 
@@ -3135,12 +3271,13 @@ class WeReadApplication:
 
     async def _wait_until_next_day(self):
         """等待到第二天"""
-        now = datetime.now()
-        tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        tomorrow += timedelta(days=1)
+        daily_start = self.config.daemon.daily_start_time
+        now = (datetime.now(ZoneInfo(self.config.schedule.timezone))
+               if daily_start else datetime.now())
+        tomorrow = daemon_day_start(now, daily_start, days=1)
         wait_seconds = (tomorrow - now).total_seconds()
 
-        logging.info(f"⏰ 等待到明天 00:00，剩余 {wait_seconds/3600:.1f} 小时")
+        logging.info("⏰ 等待到 %s，剩余 %.1f 小时", tomorrow.isoformat(), wait_seconds / 3600)
 
         await interruptible_sleep(
             wait_seconds,
@@ -3394,6 +3531,7 @@ class WeReadSessionManager:
         config: WeReadConfig,
         user_config: UserConfig = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        http_client: Optional[HttpClient] = None,
     ):
         self.config = config
         self.user_config = user_config
@@ -3405,7 +3543,7 @@ class WeReadSessionManager:
             config.reading, user_config
         )
 
-        self.http_client = HttpClient(config.network)
+        self.http_client = http_client or HttpClient(config.network)
         self.notification_service = NotificationService(config.notification)
         self.behavior_simulator = HumanBehaviorSimulator(
             config.human_simulation
@@ -3778,7 +3916,7 @@ class WeReadSessionManager:
                 result = SessionResult(
                     SessionStatus.FAILED,
                     self.session_stats,
-                    RuntimeErrorCategory.AUTH,
+                    getattr(self, "_refresh_failure_category", RuntimeErrorCategory.AUTH),
                     "Cookie 刷新失败",
                 )
                 await self._notify_session_result(result)
@@ -3855,7 +3993,9 @@ class WeReadSessionManager:
                     )
                     break
 
-                if consecutive_failures >= max_failures:
+                if (consecutive_failures >= max_failures
+                        or (getattr(self, "stop_on_auth_failure", False)
+                            and last_failure_category == RuntimeErrorCategory.AUTH)):
                     result = SessionResult(
                         SessionStatus.FAILED,
                         self.session_stats,
@@ -3933,11 +4073,13 @@ class WeReadSessionManager:
         except Exception as exc:
             logging.warning("会话通知发送失败: %s", exc)
 
-    def _prepare_read_payload(self, last_time: int) -> Tuple[str, str]:
+    def _prepare_read_payload(
+        self, last_time: int, position: Optional[Tuple[str, str]] = None,
+    ) -> Tuple[str, str]:
         """准备单次阅读请求的协议载荷"""
         self.data.pop('s', None)
 
-        book_id, chapter_id = self.reading_manager.get_next_reading_position()
+        book_id, chapter_id = position or self.reading_manager.get_next_reading_position()
         self.data['b'] = book_id
         self.data['c'] = chapter_id
 
@@ -4149,6 +4291,1449 @@ class WeReadSessionManager:
 # ======================
 # 执行历史持久化
 # ======================
+
+
+WEREAD_ORIGIN = "https://weread.qq.com"
+QR_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+)
+
+
+class QRServiceError(RuntimeError):
+    """仅携带可公开的错误信息，禁止拼入上游响应或认证 URL。"""
+
+    def __init__(
+        self,
+        message: str,
+        category: RuntimeErrorCategory = RuntimeErrorCategory.PROTOCOL,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+class AuthStateStore:
+    """凭据代际只在登录/选书时改变；续期不能覆盖更新后的代际。"""
+
+    # Note: 直接接口与原子凭据存储的取舍见 docs/README.md#扫码模式实现说明。
+
+    def __init__(self, path: Union[str, Path]) -> None:
+        self.path = Path(path)
+        if self.path.exists():
+            try:
+                state = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict) or state.get("version") != 1:
+                    raise ValueError()
+                if (
+                    not isinstance(state.get("revision"), int)
+                    or state["revision"] < 0
+                    or not isinstance(state.get("cookies"), dict)
+                    or not isinstance(state.get("user_agent"), str)
+                    or not state["user_agent"]
+                    or not str(state.get("device_fingerprint", "")).isdigit()
+                    or not isinstance(state.get("account"), dict)
+                    or not isinstance(state.get("book"), dict)
+                ):
+                    raise ValueError()
+                for key, value in state["cookies"].items():
+                    if (
+                        not re.fullmatch(r"[\w-]+", key)
+                        or not isinstance(value, str)
+                        or any(char in value for char in "\r\n;")
+                    ):
+                        raise ValueError()
+                if any(char in state["user_agent"] for char in "\r\n"):
+                    raise ValueError()
+                self.state = state
+            except (OSError, ValueError, TypeError):
+                raise ConfigError(
+                    "auth.state_file 无法读取或格式损坏，请恢复备份"
+                ) from None
+        else:
+            self.state = {
+                "version": 1,
+                "revision": 0,
+                "device_fingerprint": str(secrets.randbits(32)),
+                "user_agent": QR_USER_AGENT,
+                "cookies": {},
+                "account": {},
+                "book": {},
+                "needs_login": False,
+            }
+            self._write(self.state)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.state)
+
+    def _write(self, state: Dict[str, Any]) -> None:
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=".auth-",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                os.chmod(temporary, 0o600)
+                json.dump(state, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except OSError:
+            raise QRServiceError(
+                "凭据保存失败，请检查数据目录权限和磁盘空间",
+                RuntimeErrorCategory.CONFIG,
+            ) from None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def update(
+        self, changes: Dict[str, Any], revision: int, bump: bool = False
+    ) -> bool:
+        if revision != self.state["revision"]:
+            return False
+        updated = self.snapshot()
+        updated.update(copy.deepcopy(changes))
+        if bump:
+            updated["revision"] += 1
+        self._write(updated)
+        self.state = updated
+        return True
+
+
+def merge_response_cookies(
+    cookies: Dict[str, str], response: Any
+) -> Dict[str, str]:
+    """逐条解析 Set-Cookie，包括删除语义，不按逗号拆分 Expires。"""
+    merged = cookies.copy()
+    for header in response.headers.get_list("set-cookie"):
+        parsed = SimpleCookie()
+        try:
+            parsed.load(header)
+        except CookieError:
+            continue
+        for name, item in parsed.items():
+            domain = item["domain"].lstrip(".").lower()
+            if domain and domain != "weread.qq.com":
+                continue
+            if item["path"] not in ("", "/"):
+                continue
+            deleted = False
+            try:
+                if item["max-age"]:
+                    deleted = int(item["max-age"]) <= 0
+                elif item["expires"]:
+                    expiry = parsedate_to_datetime(item["expires"])
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    deleted = expiry <= datetime.now(timezone.utc)
+            except (ValueError, OverflowError):
+                continue
+            if deleted:
+                merged.pop(name, None)
+            elif not any(char in item.value for char in "\r\n;"):
+                merged[name] = item.value
+    return merged
+
+
+def encode_weread_id(value: Union[str, int]) -> str:
+    """网页书籍/章节标识编码，与阅读请求签名是两个不同的算法。"""
+    raw = str(value)
+    digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
+    if raw.isascii() and raw.isdigit():
+        chunks = [
+            format(int(raw[i : i + 9]), "x") for i in range(0, len(raw), 9)
+        ]
+        kind = "3"
+    else:
+        chunks = ["".join(format(ord(char), "x") for char in raw)]
+        kind = "4"
+    encoded = digest[:3] + kind + "2" + digest[-2:]
+    encoded += "g".join(format(len(chunk), "02x") + chunk for chunk in chunks)
+    if len(encoded) < 20:
+        encoded += digest[: 20 - len(encoded)]
+    return encoded + hashlib.md5(encoded.encode("utf-8")).hexdigest()[:3]
+
+
+def web_app_id(user_agent: str) -> str:
+    parts = "".join(str(len(part) % 10) for part in user_agent.split(" ")[:12])
+    number = 0
+    for char in user_agent:
+        number = (131 * number + ord(char)) & 0x7FFFFFFF
+    return f"wb{parts}h{number}"
+
+
+def parse_reader_state(html: str) -> Dict[str, Any]:
+    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*", html)
+    try:
+        if match is None:
+            raise ValueError()
+        state, _ = json.JSONDecoder().raw_decode(html[match.end() :])
+        reader = state["reader"]
+        if not isinstance(reader, dict):
+            raise ValueError()
+        if reader.get("isBookForbidden") or reader.get("isPdfError"):
+            raise QRServiceError("所选书籍当前不可阅读，请选择其他书籍")
+        if not all(
+            isinstance(reader.get(key), str) and reader[key]
+            for key in ("psvts", "token")
+        ):
+            raise ValueError()
+        return reader
+    except (ValueError, KeyError, TypeError):
+        raise QRServiceError(
+            "阅读页缺少必要会话参数，当前网页协议不兼容"
+        ) from None
+
+
+class WeReadQRClient:
+    """直接对接官网；日志和对外异常均不包含认证数据。"""
+
+    def __init__(
+        self,
+        config: NetworkConfig,
+        state: Dict[str, Any],
+        save_cookies: Optional[
+            Callable[[Dict[str, str]], Optional[Dict[str, str]]]
+        ] = None,
+    ) -> None:
+        self.http = HttpClient(config)
+        self.cookies = state.get("cookies", {}).copy()
+        self.cookies["wr_fp"] = state["device_fingerprint"]
+        self.user_agent = state["user_agent"]
+        self.save_cookies = save_cookies
+
+    async def close(self) -> None:
+        await self.http.close()
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+        timeout: Optional[int] = None,
+    ) -> Any:
+        headers = {
+            "User-Agent": self.user_agent,
+            "Origin": WEREAD_ORIGIN,
+            "Referer": WEREAD_ORIGIN + "/",
+            "Accept": "application/json, text/plain, */*",
+            "Cookie": "; ".join(
+                f"{key}={value}" for key, value in self.cookies.items()
+            ),
+        }
+        if self.cookies.get("wr_vid") and self.cookies.get("wr_skey"):
+            headers.update(
+                {
+                    "X-Vid": self.cookies["wr_vid"],
+                    "X-Skey": self.cookies["wr_skey"],
+                }
+            )
+        try:
+            # 登录 UID 必须紧接长轮询；阅读限速会造成手机确认先于监听。
+            login_handshake = method == "GET" and path in {
+                "/api/auth/getLoginUid", "/api/auth/getLoginInfo",
+            }
+            if not login_handshake:
+                await self.http._rate_limiter.acquire()
+            response = await self.http._client.request(
+                method,
+                WEREAD_ORIGIN + path,
+                headers=headers,
+                json=body,
+                params=params,
+                timeout=timeout or self.http.config.timeout,
+            )
+        except httpx.HTTPError as exc:
+            logging.warning(
+                "微信读书网络请求失败: path=%s error_type=%s",
+                path, type(exc).__name__,
+            )
+            raise QRServiceError(
+                "微信读书连接失败，请稍后重试", RuntimeErrorCategory.NETWORK
+            ) from None
+        finally:
+            # 使用显式 Cookie 快照，避免 host-only / domain 重名凭据同时发出。
+            self.http._client.cookies.clear()
+        if response.status_code == 401:
+            raise QRServiceError(
+                "登录已失效，请重新扫码", RuntimeErrorCategory.AUTH
+            )
+        if response.status_code >= 400:
+            category = (
+                RuntimeErrorCategory.NETWORK
+                if response.status_code == 429 or response.status_code >= 500
+                else RuntimeErrorCategory.PROTOCOL
+            )
+            raise QRServiceError(
+                f"微信读书请求失败（HTTP {response.status_code}）", category
+            )
+        if response.is_redirect:
+            raise QRServiceError("微信读书返回意外跳转，请重新登录或稍后重试")
+        if len(response.content) > 8 * 1024 * 1024:
+            raise QRServiceError("微信读书响应超过大小限制")
+        updated = merge_response_cookies(self.cookies, response)
+        if updated != self.cookies:
+            self.cookies = updated
+            if self.save_cookies:
+                persisted = self.save_cookies(updated)
+                if persisted is not None:
+                    self.cookies = persisted
+        return response
+
+    async def json(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        response = await self.request(method, path, body, params, timeout)
+        try:
+            data = response.json()
+        except ValueError:
+            raise QRServiceError(
+                "微信读书返回非 JSON 响应，接口暂不可用"
+            ) from None
+        if not isinstance(data, dict):
+            raise QRServiceError("微信读书响应结构不兼容")
+        code = data.get("errCode", data.get("errcode", 0))
+        if str(code) in {"-2010", "-2011", "-2012"}:
+            raise QRServiceError(
+                "登录已失效，请重新扫码", RuntimeErrorCategory.AUTH
+            )
+        if code not in (0, "0", None):
+            raise QRServiceError("微信读书拒绝了请求，请重试或检查书籍可用性")
+        return data
+
+    async def verify_identity(self) -> Dict[str, str]:
+        vid = self.cookies.get("wr_vid", "")
+        if not vid or not self.cookies.get("wr_skey"):
+            raise QRServiceError("登录响应未包含完整凭据")
+        data = await self.json("GET", "/api/userInfo", params={"userVid": vid})
+        if not isinstance(data.get("name"), str) or not data["name"]:
+            raise QRServiceError("账号信息验证失败，请重新扫码")
+        if data.get("vid") is not None and str(data["vid"]) != vid:
+            raise QRServiceError("账号信息与登录凭据不匹配")
+        return {"vid": vid, "name": data["name"]}
+
+    async def renew(self, preferred_ql: bool) -> None:
+        errors = []
+        for extra in ({"ql": preferred_ql}, {"ql": not preferred_ql}, {}):
+            try:
+                data = await self.json(
+                    "POST",
+                    "/web/login/renewal",
+                    {
+                        "rq": "%2Fweb%2Fbook%2Fread",
+                        **extra,
+                    },
+                )
+                if data.get("succ") in (True, 1) and self.cookies.get(
+                    "wr_skey"
+                ):
+                    return
+                errors.append(QRServiceError("续期响应不兼容，请稍后重试"))
+            except QRServiceError as exc:
+                if exc.category == RuntimeErrorCategory.CONFIG:
+                    raise
+                errors.append(exc)
+        if all(exc.category == RuntimeErrorCategory.AUTH for exc in errors):
+            raise errors[-1]
+        network = next(
+            (
+                exc
+                for exc in errors
+                if exc.category == RuntimeErrorCategory.NETWORK
+            ),
+            None,
+        )
+        raise network or QRServiceError("凭据暂时无法续期，尚不能确认登录失效")
+
+    async def shelf(self) -> List[Dict[str, str]]:
+        data = await self.json("GET", "/web/shelf/sync")
+        books = data.get("books")
+        if not isinstance(books, list):
+            raise QRServiceError("书架响应不兼容")
+        result = []
+        for book in books:
+            if not isinstance(book, dict):
+                continue
+            book_id = str(book.get("bookId", ""))
+            title = book.get("title")
+            if (
+                book_id.isascii()
+                and book_id.isdigit()
+                and isinstance(title, str)
+            ):
+                result.append({"id": book_id, "title": title})
+        return result
+
+    async def prepare_book(self, book: Dict[str, str]) -> Dict[str, Any]:
+        book_id = book["id"]
+        catalog = await self.json(
+            "POST", "/web/book/chapterInfos", {"bookIds": [book_id]}
+        )
+        records = catalog.get("data", [])
+        if not isinstance(records, list):
+            raise QRServiceError("目录响应不兼容")
+        record = next(
+            (
+                item
+                for item in records
+                if isinstance(item, dict)
+                and str(item.get("bookId")) == book_id
+            ),
+            None,
+        )
+        if record is None or not isinstance(record.get("updated"), list):
+            raise QRServiceError("未取得所选书籍目录")
+        chapters = []
+        for chapter in record["updated"]:
+            if not isinstance(chapter, dict):
+                continue
+            uid = chapter.get("chapterUid")
+            index = chapter.get("chapterIdx")
+            if not isinstance(uid, int) or not isinstance(index, int):
+                continue
+            if chapter.get("wordCount") == 0 or chapter.get(
+                "title", ""
+            ).strip() in {
+                "封面",
+                "目录",
+                "版权",
+                "版权信息",
+                "扉页",
+            }:
+                continue
+            chapters.append(
+                {"uid": uid, "index": index, "id": encode_weread_id(uid)}
+            )
+        chapters.sort(key=lambda item: item["index"])
+        if not chapters:
+            raise QRServiceError("该书没有可用的正文章节，请选择其他书籍")
+        progress = await self.json(
+            "GET", "/web/book/getProgress", params={"bookId": book_id}
+        )
+        progress = progress.get("book", progress)
+        if not isinstance(progress, dict):
+            raise QRServiceError("阅读进度响应不兼容")
+        chapter = next(
+            (
+                item
+                for item in chapters
+                if str(item["uid"]) == str(progress.get("chapterUid"))
+            ),
+            chapters[0],
+        )
+        reader = await self.reader(book_id, chapter["uid"])
+        return {
+            "book": book.copy(),
+            "chapters": chapters,
+            "chapter": chapter,
+            "reader": reader,
+            "progress": progress,
+        }
+
+    async def reader(self, book_id: str, chapter_uid: int) -> Dict[str, Any]:
+        path = (
+            "/web/reader/"
+            + encode_weread_id(book_id)
+            + "k"
+            + encode_weread_id(chapter_uid)
+        )
+        response = await self.request("GET", path)
+        reader = parse_reader_state(response.text)
+        info = reader.get("bookInfo", {})
+        if str(info.get("bookId", "")) != book_id:
+            raise QRServiceError("阅读页与所选书籍不匹配")
+        return reader
+
+
+class QRReadingSession(WeReadSessionManager):
+    """为原阅读循环提供直接接口取得的状态，不生成或存储 cURL。"""
+
+    stop_on_auth_failure = True
+
+    def __init__(
+        self,
+        config: WeReadConfig,
+        client: WeReadQRClient,
+        prepared: Dict[str, Any],
+        is_cancelled: Callable[[], bool],
+    ) -> None:
+        self.qr_client = client
+        self.prepared = prepared
+        self.reader_context = prepared["reader"]
+        self.reader_chapter = prepared["chapter"]["id"]
+        self._initial_renewal_done = True
+        self._first_read = True
+        book = BookInfo(
+            name=prepared["book"]["title"],
+            book_id=encode_weread_id(prepared["book"]["id"]),
+            chapters=[chapter["id"] for chapter in prepared["chapters"]],
+            chapter_infos=[
+                ChapterInfo(chapter["id"], chapter["index"])
+                for chapter in prepared["chapters"]
+            ],
+        )
+        effective = replace(
+            config,
+            reading=replace(
+                config.reading,
+                books=[book],
+                use_curl_data_first=True,
+                fallback_to_config=False,
+            ),
+        )
+        super().__init__(
+            effective, is_cancelled=is_cancelled, http_client=client.http
+        )
+
+    def _load_curl_config(self) -> None:
+        self.headers = {"user-agent": self.qr_client.user_agent}
+        self.cookies = self.qr_client.cookies
+        self.data.update(
+            {
+                "appId": web_app_id(self.qr_client.user_agent),
+                "co": self.prepared["progress"].get("chapterOffset", 0),
+                "pr": self.prepared["progress"].get("progress", 0),
+                "sm": "",
+            }
+        )
+        self._apply_protocol_reading_position(
+            encode_weread_id(self.prepared["book"]["id"]),
+            self.prepared["chapter"]["id"],
+            self.prepared["chapter"]["index"],
+        )
+
+    def _initialize_session_user_agent(self) -> None:
+        self.session_user_agent = self.qr_client.user_agent
+
+    def _apply_user_identity_to_payload(
+        self, book_id: str, chapter_id: str
+    ) -> None:
+        self.data["appId"] = web_app_id(self.qr_client.user_agent)
+        self.data["ps"] = self.reader_context["psvts"]
+        self.data["pc"] = self.reader_context.get("pclts") or encode_weread_id(
+            int(time.time())
+        )
+        self.KEY = self.reader_context["token"]
+
+    async def _refresh_cookie(self) -> bool:
+        if self._initial_renewal_done:
+            self._initial_renewal_done = False
+            return True
+        try:
+            await self.qr_client.renew(self.config.hack.cookie_refresh_ql)
+            self.cookies = self.qr_client.cookies
+            return True
+        except QRServiceError as exc:
+            self._refresh_failure_category = exc.category
+            logging.warning("扫码账号续期失败: %s", exc)
+            return False
+
+    async def _simulate_reading_request(
+        self, last_time: int
+    ) -> Tuple[bool, float]:
+        started = time.monotonic()
+        try:
+            if self._first_read:
+                position = (
+                    encode_weread_id(self.prepared["book"]["id"]),
+                    self.prepared["chapter"]["id"],
+                )
+                self._first_read = False
+            else:
+                position = self.reading_manager.get_next_reading_position()
+            if position[1] != self.reader_chapter:
+                chapter = next(
+                    item
+                    for item in self.prepared["chapters"]
+                    if item["id"] == position[1]
+                )
+                self.reader_context = await self.qr_client.reader(
+                    self.prepared["book"]["id"],
+                    chapter["uid"],
+                )
+                self.reader_chapter = position[1]
+                self.data.update({"co": 0, "pr": 0})
+            self._prepare_read_payload(last_time, position)
+            if not self.reader_context.get("pclts"):
+                self.data["pc"] = encode_weread_id(self.data["ct"])
+                self.data.pop("s", None)
+                self.data["s"] = self._calculate_hash(
+                    self._encode_data(self.data)
+                )
+            self._record_reading_target(*position)
+            response = await self.qr_client.json(
+                "POST", "/web/book/read", self.data
+            )
+            success = is_successful_read_response(response)
+            self._last_read_error_category = (
+                None if success else RuntimeErrorCategory.PROTOCOL
+            )
+            return success, time.monotonic() - started
+        except QRServiceError as exc:
+            self._last_read_error_category = exc.category
+            logging.warning("扫码账号阅读失败: %s", exc)
+            if exc.category == RuntimeErrorCategory.AUTH:
+                try:
+                    await self.qr_client.renew(
+                        self.config.hack.cookie_refresh_ql
+                    )
+                    chapter = next(
+                        item
+                        for item in self.prepared["chapters"]
+                        if item["id"] == self.reader_chapter
+                    )
+                    self.reader_context = await self.qr_client.reader(
+                        self.prepared["book"]["id"],
+                        chapter["uid"],
+                    )
+                    self._last_read_error_category = (
+                        RuntimeErrorCategory.PROTOCOL
+                    )
+                except QRServiceError as renewal_error:
+                    self._last_read_error_category = renewal_error.category
+            return False, time.monotonic() - started
+
+    async def _notify_session_result(self, result: SessionResult) -> None:
+        # 认证失败由常驻控制器统一去重并附上管理入口。
+        if result.error_category != RuntimeErrorCategory.AUTH:
+            await super()._notify_session_result(result)
+
+
+@dataclass
+class QRLoginAttempt:
+    client: WeReadQRClient = field(repr=False)
+    revision: int
+    id: str = field(default_factory=lambda: secrets.token_urlsafe(24))
+    uid: str = field(default="", repr=False)
+    otp: str = field(default="", repr=False)
+    status: str = "creating"
+    message: str = "正在获取二维码"
+    deadline: float = field(default_factory=lambda: time.monotonic() + 300)
+    otp_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    task: Optional[asyncio.Task] = field(default=None, repr=False)
+
+
+class QRRuntime:
+    """单账号控制器：Web、扫码长轮询和阅读共享一个事件循环。"""
+
+    def __init__(self, application: WeReadApplication) -> None:
+        self.application = application
+        self.config = application.config
+        self.store = AuthStateStore(self.config.auth.state_file)
+        self.change_lock = asyncio.Lock()
+        self.resume = asyncio.Event()
+        self.cancel_reading = asyncio.Event()
+        self.active_task: Optional[asyncio.Task] = None
+        self.flow: Optional[QRLoginAttempt] = None
+        self.next_run: Optional[datetime] = None
+        self.last_error = ""
+        self.auth_notified = bool(self.store.state.get("needs_login"))
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.login_attempts: Dict[str, List[float]] = {}
+        self.tz = ZoneInfo(self.config.schedule.timezone or "Asia/Shanghai")
+
+    def ready(self) -> bool:
+        state = self.store.state
+        return bool(
+            state["account"]
+            and state["book"]
+            and state["cookies"].get("wr_skey")
+            and not state.get("needs_login")
+        )
+
+    def client(self, snapshot: Optional[dict] = None) -> WeReadQRClient:
+        state = snapshot or self.store.snapshot()
+        previous = state["cookies"].copy()
+
+        def persist(cookies: Dict[str, str]) -> Dict[str, str]:
+            nonlocal previous
+            if state["revision"] != self.store.state["revision"]:
+                raise QRServiceError(
+                    "凭据已更新，请重试当前操作", RuntimeErrorCategory.CONFIG
+                )
+            # 书架请求可能与阅读续期交错，不能写回快照中未改变的旧字段。
+            merged = self.store.state["cookies"].copy()
+            for key in previous.keys() | cookies.keys():
+                if previous.get(key) != cookies.get(key) and merged.get(
+                    key
+                ) == previous.get(key):
+                    if key in cookies:
+                        merged[key] = cookies[key]
+                    else:
+                        merged.pop(key, None)
+            self.store.update({"cookies": merged}, state["revision"])
+            previous = merged.copy()
+            return merged
+
+        return WeReadQRClient(self.config.network, state, persist)
+
+    async def stop_reading(self) -> None:
+        self.cancel_reading.set()
+        task = self.active_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def cancel_login(self) -> None:
+        flow = self.flow
+        self.flow = None
+        if flow is not None:
+            if flow.task and not flow.task.done():
+                logging.info("扫码登录阶段: state=cancelled")
+                flow.task.cancel()
+                await asyncio.gather(flow.task, return_exceptions=True)
+            await flow.client.close()
+
+    async def start_login(self) -> None:
+        async with self.change_lock:
+            await self.cancel_login()
+            state = self.store.snapshot()
+            state["cookies"] = {}
+            self.flow = QRLoginAttempt(
+                WeReadQRClient(self.config.network, state),
+                state["revision"],
+            )
+            self.flow.task = asyncio.create_task(self._poll_login(self.flow))
+
+    async def _poll_login(self, flow: QRLoginAttempt) -> None:
+        started = time.monotonic()
+        phase = "prepare"
+        try:
+            logging.info("扫码登录阶段: state=prepare handshake_version=2")
+            await flow.client.request("GET", "/")
+            phase = "get_uid"
+            data = await flow.client.json("GET", "/api/auth/getLoginUid")
+            uid = data.get("uid")
+            if not isinstance(uid, str) or not uid:
+                raise QRServiceError("未能取得扫码标识，当前登录接口不兼容")
+            flow.uid = uid
+            flow.status, flow.message = "waiting", "请使用微信扫码并确认登录"
+            while self.flow is flow and time.monotonic() < flow.deadline:
+                phase = "wait_confirmation"
+                logging.info("扫码登录阶段: state=wait_confirmation")
+                result = await flow.client.json(
+                    "GET",
+                    "/api/auth/getLoginInfo",
+                    params={"uid": flow.uid, "otp": flow.otp},
+                    timeout=70,
+                )
+                flow.otp = ""
+                if result.get("succeed") is True:
+                    phase = "verify_credentials"
+                    flow.status = "verifying"
+                    flow.message = "手机已确认，正在验证并保存登录"
+                    logging.info("扫码登录阶段: state=verify_credentials")
+                    vid = str(result.get("webLoginVid") or "")
+                    token = result.get("accessToken")
+                    if (
+                        not vid.isdigit()
+                        or not isinstance(token, str)
+                        or not token
+                    ):
+                        raise QRServiceError("登录响应未包含完整凭据")
+                    flow.client.cookies.update(
+                        {"wr_vid": vid, "wr_skey": token, "wr_ql": "0"}
+                    )
+                    refresh = result.get("refreshToken")
+                    if isinstance(refresh, str) and refresh:
+                        flow.client.cookies["wr_rt"] = urllib.parse.quote(
+                            refresh, safe=""
+                        )
+                    account = await flow.client.verify_identity()
+                    await flow.client.renew(self.config.hack.cookie_refresh_ql)
+                    await self._accept_login(flow, account)
+                    return
+                code = result.get("logicCode")
+                known_code = code if code in {
+                    "NEED_OTP", "OTP_NOT_MATCH", "LOGIN_TIMEOUT", "OTP_EXPIRED",
+                } else "UNKNOWN"
+                logging.info(
+                    "扫码确认响应: state=%s elapsed=%.2fs",
+                    known_code, time.monotonic() - started,
+                )
+                if code in {"NEED_OTP", "OTP_NOT_MATCH"}:
+                    flow.status = "otp"
+                    flow.message = (
+                        "请输入手机上显示的四位验证码"
+                        if code == "NEED_OTP"
+                        else "验证码不正确，请重新输入"
+                    )
+                    flow.otp_ready.clear()
+                    await asyncio.wait_for(
+                        flow.otp_ready.wait(),
+                        max(0.1, flow.deadline - time.monotonic()),
+                    )
+                    flow.status, flow.message = "waiting", "正在验证"
+                elif code in {"LOGIN_TIMEOUT", "OTP_EXPIRED"}:
+                    flow.status, flow.message = (
+                        "expired",
+                        "二维码或验证码已过期，请刷新",
+                    )
+                    return
+                else:
+                    raise QRServiceError(
+                        "微信读书返回未知登录状态，请刷新二维码重试"
+                    )
+            flow.status, flow.message = "expired", "二维码已过期，请刷新"
+        except asyncio.TimeoutError:
+            flow.status, flow.message = "expired", "二维码已过期，请刷新"
+        except QRServiceError as exc:
+            flow.status, flow.message = "failed", str(exc)
+            logging.warning(
+                "扫码登录未完成: phase=%s category=%s message=%s",
+                phase, exc.category.value, exc,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            flow.status, flow.message = "failed", "登录处理失败，请重试"
+            logging.error("扫码登录处理失败，类型=%s", type(exc).__name__)
+        finally:
+            flow.otp = ""
+            await flow.client.close()
+
+    async def _accept_login(
+        self, flow: QRLoginAttempt, account: Dict[str, str]
+    ) -> None:
+        async with self.change_lock:
+            if self.flow is not flow:
+                return
+            if time.monotonic() >= flow.deadline:
+                flow.status, flow.message = "expired", "二维码已过期，请刷新"
+                return
+            old_account = self.store.state["account"]
+            if old_account and old_account["vid"] != account["vid"]:
+                raise QRServiceError(
+                    "扫到的账号与已绑定账号不同，请使用原账号重新扫码"
+                )
+            if flow.revision != self.store.state["revision"]:
+                raise QRServiceError("配置已更新，请重新获取二维码")
+            await self.stop_reading()
+            self.store.update(
+                {
+                    "account": account,
+                    "cookies": flow.client.cookies,
+                    "needs_login": False,
+                },
+                flow.revision,
+                bump=True,
+            )
+            self.auth_notified = False
+            self.last_error = ""
+            flow.status, flow.message = "success", "登录成功"
+            logging.info("扫码登录阶段: state=success")
+            if self.store.state["book"]:
+                self.resume.set()
+
+    async def select_book(self, book_id: str) -> None:
+        async with self.change_lock:
+            if not self.store.state["account"] or self.store.state.get(
+                "needs_login"
+            ):
+                raise QRServiceError(
+                    "请先完成微信扫码登录", RuntimeErrorCategory.AUTH
+                )
+            state = self.store.snapshot()
+            client = self.client(state)
+            try:
+                books = await client.shelf()
+                book = next(
+                    (item for item in books if item["id"] == book_id), None
+                )
+                if book is None:
+                    raise QRServiceError("请选择当前书架中的书籍")
+                await client.prepare_book(book)
+                if book == self.store.state["book"]:
+                    if self.active_task is None:
+                        self.last_error = ""
+                        self.resume.set()
+                    return
+                await self.stop_reading()
+                if not self.store.update(
+                    {"book": book}, state["revision"], bump=True
+                ):
+                    raise QRServiceError("配置已变化，请重新选择书籍")
+                self.last_error = ""
+                self.resume.set()
+            finally:
+                await client.close()
+
+    async def _run_once(self, state: Dict[str, Any]) -> SessionResult:
+        client = self.client(state)
+        session = None
+        with log_context(state["account"]["name"], uuid.uuid4().hex[:10]):
+            try:
+                await client.renew(self.config.hack.cookie_refresh_ql)
+                prepared = await client.prepare_book(state["book"])
+                session = QRReadingSession(
+                    self.config,
+                    client,
+                    prepared,
+                    lambda: (
+                        self.cancel_reading.is_set()
+                        or self.application.is_shutdown_requested()
+                    ),
+                )
+                return await session.start_reading_session()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                category = classify_runtime_error(exc)
+                message = (
+                    str(exc)
+                    if isinstance(exc, QRServiceError)
+                    else "阅读初始化失败"
+                )
+                logging.warning(
+                    "扫码账号初始化失败，分类=%s，类型=%s",
+                    category.value,
+                    type(exc).__name__,
+                )
+                return SessionResult(
+                    SessionStatus.FAILED, ReadingSession(), category, message
+                )
+            finally:
+                if session is None:
+                    await client.close()
+
+    async def auth_failed(self, revision: int) -> None:
+        if revision != self.store.state["revision"]:
+            return
+        self.store.update({"needs_login": True}, revision)
+        if not self.auth_notified:
+            self.auth_notified = True
+            await NotificationService(
+                self.config.notification
+            ).send_notification_async(
+                "微信读书登录已失效，请打开管理页面重新扫码：\n"
+                + self.config.web.public_url,
+                event=NotificationEvent.SESSION_FAILURE,
+            )
+
+    def _scheduled_time(self, now: datetime) -> datetime:
+        return croniter(self.config.schedule.cron_expression, now).get_next(
+            datetime
+        )
+
+    def _daily_limit(self, now: datetime) -> bool:
+        if self.config.startup_mode != "daemon":
+            return False
+        if self.store.state.get("daily_date") != now.date().isoformat():
+            self.store.update(
+                {"daily_date": now.date().isoformat(), "daily_count": 0},
+                self.store.state["revision"],
+            )
+        return (
+            self.store.state.get("daily_count", 0)
+            >= self.config.daemon.max_daily_sessions
+        )
+
+    def _daemon_plan_key(self) -> str:
+        return json.dumps(
+            [
+                self.config.daemon.daily_start_time,
+                self.config.daemon.session_interval,
+                self.config.daemon.max_daily_sessions,
+                self.config.schedule.timezone,
+            ],
+            ensure_ascii=True,
+        )
+
+    def _save_daemon_next_run(self, when: Optional[datetime]) -> None:
+        self.next_run = when
+        if not self.config.daemon.daily_start_time:
+            return
+        value = when.isoformat() if when is not None else None
+        key = self._daemon_plan_key()
+        if (
+            self.store.state.get("daemon_next_run") != value
+            or self.store.state.get("daemon_plan_key") != key
+        ):
+            self.store.update(
+                {
+                    "daemon_next_run": value,
+                    "daemon_plan_key": key,
+                },
+                self.store.state["revision"],
+            )
+            if when is not None:
+                logging.info("下一次随机阅读计划: %s", when.isoformat())
+
+    def _restore_daemon_next_run(self, now: datetime) -> datetime:
+        """恢复已抽取的休息间隔；首次错过起始时间时补跑。"""
+        start_time = self.config.daemon.daily_start_time
+        anchor = daemon_day_start(now, start_time)
+        tomorrow = daemon_day_start(now, start_time, days=1)
+        if self._daily_limit(now):
+            return tomorrow
+        if now < anchor:
+            return anchor
+        if self.store.state.get("daemon_plan_key") == self._daemon_plan_key():
+            try:
+                saved = datetime.fromisoformat(
+                    self.store.state["daemon_next_run"]
+                )
+                if saved.tzinfo is not None:
+                    saved = saved.astimezone(self.tz)
+                    if saved <= tomorrow:
+                        return max(now, saved)
+            except (KeyError, ValueError, TypeError):
+                pass
+        if self.store.state.get("daily_count", 0) == 0:
+            return now
+        # 启动前已计次但没能保存结束时间，保守等待完整间隔，避免重复跑。
+        return daemon_interval_start(
+            now,
+            RandomHelper.get_random_from_range(
+                self.config.daemon.session_interval,
+            ),
+            start_time,
+        )
+
+    def _next_daemon_session(self, now: datetime) -> datetime:
+        start_time = self.config.daemon.daily_start_time
+        if self._daily_limit(now):
+            return daemon_day_start(now, start_time, days=1)
+        return daemon_interval_start(
+            now,
+            RandomHelper.get_random_from_range(
+                self.config.daemon.session_interval,
+            ),
+            start_time,
+        )
+
+    async def run(self) -> RunResult:
+        app = build_qr_web_app(self)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        last_result = RunResult(final_status="cancelled", user_count=1)
+        mode = self.config.startup_mode
+        now = datetime.now(self.tz)
+        if mode == "scheduled":
+            self.next_run = self._scheduled_time(now)
+        elif mode == "daemon" and self.config.daemon.daily_start_time:
+            self._save_daemon_next_run(self._restore_daemon_next_run(now))
+        elif self.ready():
+            self.resume.set()
+        try:
+            await web.TCPSite(
+                runner, self.config.web.host, self.config.web.port
+            ).start()
+            logging.info("扫码管理服务已启动: %s", self.config.web.public_url)
+            while not self.application.is_shutdown_requested():
+                now = datetime.now(self.tz)
+                if mode == "daemon" and self.config.daemon.daily_start_time:
+                    anchor = daemon_day_start(
+                        now, self.config.daemon.daily_start_time
+                    )
+                    if now < anchor:
+                        # 首次选书、重新扫码也不能越过每日最早开始时间。
+                        self.resume.clear()
+                        self._save_daemon_next_run(anchor)
+                due = self.next_run is not None and now >= self.next_run
+                if self.ready() and (self.resume.is_set() or due):
+                    if self._daily_limit(now):
+                        self.resume.clear()
+                        self._save_daemon_next_run(
+                            daemon_day_start(
+                                now,
+                                self.config.daemon.daily_start_time,
+                                days=1,
+                            )
+                        )
+                        await interruptible_sleep(
+                            1, self.application.is_shutdown_requested
+                        )
+                        continue
+                    async with self.change_lock:
+                        if not self.ready():
+                            continue
+                        state = self.store.snapshot()
+                        self.resume.clear()
+                        self.cancel_reading.clear()
+                        if mode == "daemon":
+                            self.store.update(
+                                {
+                                    "daily_count": self.store.state.get(
+                                        "daily_count", 0
+                                    )
+                                    + 1
+                                },
+                                state["revision"],
+                            )
+                            self._save_daemon_next_run(None)
+                        self.active_task = asyncio.create_task(
+                            self._run_once(state)
+                        )
+                    try:
+                        result = await self.active_task
+                    except asyncio.CancelledError:
+                        result = SessionResult(
+                            SessionStatus.CANCELLED,
+                            ReadingSession(),
+                            message="会话已停止",
+                        )
+                    finally:
+                        self.active_task = None
+                    last_result = RunResult.from_session_results([result])
+                    summary = last_result.to_summary_dict()
+                    self.application.set_run_summary(summary)
+                    persist_run_history(
+                        self.config, "normal", run_summary=summary
+                    )
+                    if state["revision"] == self.store.state["revision"]:
+                        self.last_error = (
+                            result.message
+                            if result.status == SessionStatus.FAILED
+                            else ""
+                        )
+                        if result.error_category == RuntimeErrorCategory.AUTH:
+                            try:
+                                await self.auth_failed(state["revision"])
+                            except Exception as exc:
+                                logging.warning(
+                                    "登录失效通知未完成，类型=%s",
+                                    type(exc).__name__,
+                                )
+                    now = datetime.now(self.tz)
+                    if mode == "scheduled":
+                        self.next_run = self._scheduled_time(now)
+                    elif mode == "daemon":
+                        self._save_daemon_next_run(
+                            self._next_daemon_session(now)
+                        )
+                    else:
+                        self.next_run = None
+                elif due:
+                    # 未登录时只保留一个到期标记，恢复由扫码/选书唤醒。
+                    self.next_run = (
+                        self._scheduled_time(now)
+                        if mode == "scheduled"
+                        else None
+                    )
+                await interruptible_sleep(
+                    0.5, self.application.is_shutdown_requested
+                )
+        finally:
+            await self.cancel_login()
+            await self.stop_reading()
+            await runner.cleanup()
+        return last_result
+
+    def public_status(self) -> Dict[str, Any]:
+        state = self.store.state
+        flow = self.flow
+        history = load_run_history(self.config.history.file)
+        latest = history[-1] if history else {}
+        return {
+            "account_name": state["account"].get("name", ""),
+            "needs_login": not state["account"]
+            or bool(state.get("needs_login")),
+            "ready": self.ready(),
+            "running": self.active_task is not None,
+            "book": state["book"],
+            "error": self.last_error,
+            "next_run": self.next_run.isoformat()
+            if self.next_run and self.ready()
+            else None,
+            "last_run": {
+                key: latest.get(key)
+                for key in (
+                    "recorded_at",
+                    "final_status",
+                    "total_reads",
+                    "total_duration_seconds",
+                )
+            },
+            "qr": {
+                "id": flow.id,
+                "status": flow.status,
+                "message": flow.message,
+                "remaining": max(0, int(flow.deadline - time.monotonic())),
+                "has_image": bool(flow.uid)
+                and flow.status in {"waiting", "otp"},
+            }
+            if flow
+            else {"status": "idle", "message": "", "has_image": False},
+        }
+
+
+QR_PAGE = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>微信读书 · 账号管理</title><style nonce="__NONCE__">
+:root{color-scheme:light;--ink:#19382e;--muted:#60736a;--line:#dce5df;--green:#246249;--bg:#f5f7f3}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+header{border-bottom:1px solid var(--line);background:#fff}header>div,main{max-width:1000px;margin:auto;padding:22px 28px}
+header>div{display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{font-size:18px;font-weight:750;letter-spacing:.04em}.sub{font-size:12px;color:var(--muted)}
+main{padding-top:42px;padding-bottom:60px}h1{font-size:30px;line-height:1.3;margin:0 0 10px;letter-spacing:-.02em}h2{font-size:18px;margin:0 0 8px}p{margin:0 0 18px}label{display:block;font-size:14px;font-weight:650;margin-bottom:8px}
+.muted{color:var(--muted)}.intro{margin-bottom:30px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px}.wide{grid-column:1/-1}
+.eyebrow{color:var(--green);font-size:12px;font-weight:700;letter-spacing:.08em;margin-bottom:12px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.space{justify-content:space-between}.badge{font-size:12px;padding:4px 10px;border-radius:20px;background:#edf3ee;color:var(--green)}
+button,input,select{font:inherit;border-radius:8px;min-height:44px}button{background:var(--green);color:#fff;border:1px solid var(--green);padding:9px 17px;cursor:pointer;font-weight:600}button:hover{background:#184a35}.secondary{background:white;color:var(--ink);border-color:var(--line)}.secondary:hover{background:#f0f4ee}button:disabled{opacity:.55;cursor:wait}input,select{width:100%;padding:10px 12px;border:1px solid #a9b9ae;background:#fff;color:var(--ink);margin-bottom:16px}input:focus,select:focus,button:focus-visible{outline:3px solid #8dbaa2;outline-offset:3px}
+.login{max-width:450px;margin:18px auto}.hint{font-size:13px;color:var(--muted);margin-top:16px}.error{background:#fff0ed;color:#962f20;border:1px solid #ebc2b9;border-radius:10px;padding:12px 16px;margin-bottom:22px;overflow-wrap:anywhere}.notice{color:var(--muted);font-size:14px;min-height:24px;margin-top:12px}
+.qrbox{display:flex;justify-content:center;align-items:center;background:#f7f9f5;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:245px;margin:20px 0}#qrimage{width:220px;height:220px;background:white}.qrplaceholder{text-align:center;color:var(--muted);font-size:14px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:18px}.value{font-size:18px;font-weight:650;overflow-wrap:anywhere}.statlabel{font-size:12px;color:var(--muted);margin-bottom:5px}.bookname{font-size:22px;font-weight:650;line-height:1.5;overflow-wrap:anywhere;margin:18px 0}.footer{font-size:12px;color:var(--muted);margin-top:22px}#otpform{margin-top:16px}[hidden]{display:none!important}
+@media(max-width:650px){header>div,main{padding-left:18px;padding-right:18px}main{padding-top:28px}h1{font-size:26px}.grid{grid-template-columns:1fr}.card{padding:22px}.stats{grid-template-columns:1fr;gap:14px}.login{margin:0}.row button{flex-grow:1}}
+</style></head><body><header><div><div><div class="brand">微信读书</div><div class="sub">账号与阅读管理</div></div><button id="logout" class="secondary" hidden>退出管理</button></div></header>
+<main><div class="intro"><div class="eyebrow">WEREAD BOT</div><h1>扫码一次，继续阅读。</h1><p class="muted">登录、选书和更新凭据，都在这里完成。</p></div><div id="error" class="error" role="alert" hidden></div>
+<section id="loginpanel" class="card login"><h2>登录管理页面</h2><p class="muted">请输入部署时设置的管理密码。</p><form id="loginform"><label for="password">管理密码</label><input id="password" type="password" autocomplete="current-password" required maxlength="1024"><button type="submit">进入管理</button></form><p class="hint">管理密码与微信账号密码无关。</p></section>
+<div id="dashboard" class="grid" hidden><section class="card"><div class="row space"><h2>微信账号</h2><span id="accountbadge" class="badge">未登录</span></div><p id="accountname" class="muted">扫描二维码绑定你的微信读书账号。</p><div class="row"><button id="newqr">获取登录二维码</button><button id="cancelqr" class="secondary" hidden>取消扫码</button></div><div id="qrbox" class="qrbox" hidden><img id="qrimage" alt="微信读书登录二维码" hidden><div id="qrplaceholder" class="qrplaceholder">正在准备二维码…</div></div><div id="qrmessage" class="notice" role="status" aria-live="polite"></div><form id="otpform" hidden><label for="otp">手机上显示的四位验证码</label><input id="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{4}" minlength="4" maxlength="4" required><button type="submit">确认验证码</button></form><p class="hint">凭据更新后会自动恢复阅读，无需重启容器。</p></section>
+<section class="card"><h2>正在阅读的书</h2><p class="muted">首次登录后，从你的书架选择一本书。</p><div id="bookname" class="bookname">尚未选择</div><button id="refreshbooks" class="secondary">加载书架</button><form id="bookform" hidden><label for="books">选择书籍</label><select id="books" required></select><button type="submit">保存并开始阅读</button></form><p id="bookmessage" class="notice" role="status"></p><p class="hint">自动读取已有进度。更换书籍会结束当前会话，再开始新的阅读。</p></section>
+<section class="card wide"><div class="row space"><h2>运行状态</h2><span id="runbadge" class="badge">等待配置</span></div><div class="stats"><div><div class="statlabel">下次计划</div><div id="next" class="value">—</div></div><div><div class="statlabel">最近运行</div><div id="last" class="value">暂无记录</div></div><div><div class="statlabel">最近会话成功请求</div><div id="reads" class="value">—</div></div></div><p id="runtimeerror" class="notice" role="status"></p></section></div><p class="footer">凭据保存在此服务的数据目录中。页面不会显示 Cookie 或登录密钥。</p></main>
+<script nonce="__NONCE__">
+const el=id=>document.getElementById(id);let csrf='',attempt='',imageId='',authenticated=false,bookLoaded=false,polling=false;
+function error(message){el('error').textContent=message;el('error').hidden=!message}
+function auth(show){authenticated=show;el('loginpanel').hidden=show;el('dashboard').hidden=!show;el('logout').hidden=!show;if(!show){csrf='';el('password').value='';el('qrimage').removeAttribute('src');imageId='';bookLoaded=false}}
+async function api(path,method='GET',body){const response=await fetch('/api/'+path,{method,credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body)});let data;try{data=await response.json()}catch{throw Error('服务暂时不可用，请稍后重试')}if(response.status===401){auth(false);throw Error(data.error||'管理登录已过期')}if(!response.ok)throw Error(data.error||'操作失败');return data}
+async function action(button,fn){button.disabled=true;error('');try{await fn()}catch(e){error(e.message)}finally{button.disabled=false}}
+function render(s){csrf=s.csrf;auth(true);el('accountname').textContent=s.account_name||'扫描二维码绑定你的微信读书账号。';el('accountbadge').textContent=s.needs_login?'需要登录':'已登录';el('newqr').textContent=s.account_name?'重新扫码登录':'获取登录二维码';el('bookname').textContent=s.book.title||'尚未选择';el('refreshbooks').disabled=s.needs_login;el('runbadge').textContent=s.running?'阅读中':s.needs_login?'等待登录':s.ready?'已就绪':'等待选书';el('next').textContent=s.next_run?new Date(s.next_run).toLocaleString():'等待触发';const labels={success:'成功',failed:'失败',cancelled:'已停止',partial_success:'部分成功'};el('last').textContent=labels[s.last_run.final_status]||'暂无记录';el('reads').textContent=s.last_run.total_reads??'—';el('runtimeerror').textContent=s.error||'';const q=s.qr;attempt=q.id||'';el('qrmessage').textContent=q.message+(q.has_image?' · 剩余 '+q.remaining+' 秒':'');el('otpform').hidden=q.status!=='otp';el('cancelqr').hidden=!['creating','waiting','otp'].includes(q.status);el('qrbox').hidden=!['creating','waiting','otp'].includes(q.status);el('qrimage').hidden=!q.has_image;el('qrplaceholder').hidden=!!q.has_image;if(q.has_image&&imageId!==q.id){el('qrimage').src='/api/qr/image?id='+encodeURIComponent(q.id);imageId=q.id}if(!q.has_image){el('qrimage').removeAttribute('src');imageId=''}if(!s.needs_login&&!s.book.id&&!bookLoaded){bookLoaded=true;loadBooks().catch(e=>{bookLoaded=false;error(e.message)})}}
+async function refresh(){if(polling)return;polling=true;try{render(await api('status'))}catch(e){if(authenticated)error(e.message)}finally{polling=false}}
+async function loadBooks(){el('bookmessage').textContent='正在获取书架…';const s=await api('books');el('books').replaceChildren();for(const book of s.books){const option=document.createElement('option');option.value=book.id;option.textContent=book.title;el('books').append(option)}el('bookform').hidden=!s.books.length;el('bookmessage').textContent=s.books.length?'':'书架为空，请先在微信读书中添加一本书，再重新加载。'}
+el('loginform').addEventListener('submit',e=>{e.preventDefault();action(e.submitter,async()=>{const s=await api('session','POST',{password:el('password').value});csrf=s.csrf;el('password').value='';await refresh()})});
+el('logout').addEventListener('click',e=>action(e.target,async()=>{await api('session','DELETE');auth(false)}));
+el('newqr').addEventListener('click',e=>action(e.target,async()=>{await api('qr','POST',{});await refresh()}));
+el('cancelqr').addEventListener('click',e=>action(e.target,async()=>{await api('qr','DELETE');await refresh()}));
+el('otpform').addEventListener('submit',e=>{e.preventDefault();action(e.submitter,async()=>{await api('qr/otp','POST',{id:attempt,otp:el('otp').value});el('otp').value='';await refresh()})});
+el('refreshbooks').addEventListener('click',e=>action(e.target,loadBooks));
+el('bookform').addEventListener('submit',e=>{e.preventDefault();action(e.submitter,async()=>{await api('book','POST',{id:el('books').value});el('bookmessage').textContent='已保存，阅读任务即将开始。';await refresh()})});
+refresh();setInterval(()=>{if(authenticated)refresh()},2000);
+</script></body></html>"""
+
+
+def build_qr_web_app(runtime: QRRuntime) -> Any:
+    """同源管理 API：服务端会话、CSRF 校验、无第三方页面资源。"""
+
+    @web.middleware
+    async def security(request: Any, handler: Callable) -> Any:
+        now = time.monotonic()
+        for key in list(runtime.sessions):
+            if runtime.sessions[key]["expires"] <= now:
+                del runtime.sessions[key]
+        session = runtime.sessions.get(request.cookies.get("wr_admin", ""))
+        request["admin_session"] = session
+        is_login = request.path == "/api/session" and request.method == "POST"
+        try:
+            if request.path.startswith("/api/"):
+                if not is_login and not session:
+                    raise web.HTTPUnauthorized(text="请先登录管理页面")
+                if request.method not in {"GET", "HEAD"}:
+                    if (
+                        request.headers.get("Origin")
+                        != runtime.config.web.public_url
+                    ):
+                        raise web.HTTPForbidden(text="请求来源不匹配")
+                    if not is_login and not hmac.compare_digest(
+                        request.headers.get("X-CSRF-Token", ""),
+                        session["csrf"],
+                    ):
+                        raise web.HTTPForbidden(
+                            text="页面已过期，请刷新后重试"
+                        )
+                    if (
+                        request.method in {"POST", "PUT"}
+                        and request.content_type != "application/json"
+                    ):
+                        raise web.HTTPUnsupportedMediaType(
+                            text="请求必须使用 JSON"
+                        )
+            response = await handler(request)
+        except QRServiceError as exc:
+            response = web.json_response({"error": str(exc)}, status=400)
+        except web.HTTPException as exc:
+            response = web.json_response(
+                {"error": exc.text if exc.status < 500 else "服务暂时不可用"},
+                status=exc.status,
+            )
+        except (ValueError, TypeError, KeyError):
+            response = web.json_response(
+                {"error": "请求格式不正确"}, status=400
+            )
+        except Exception as exc:
+            logging.error("管理请求失败，类型=%s", type(exc).__name__)
+            response = web.json_response(
+                {"error": "服务暂时不可用，请稍后重试"}, status=500
+            )
+        response.headers.update(
+            {
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "X-Frame-Options": "DENY",
+            }
+        )
+        return response
+
+    app = web.Application(middlewares=[security], client_max_size=4096)
+
+    async def page(request: Any) -> Any:
+        nonce = secrets.token_urlsafe(24)
+        response = web.Response(
+            text=QR_PAGE.replace("__NONCE__", nonce), content_type="text/html"
+        )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; img-src 'self'; connect-src 'self'; "
+            f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        return response
+
+    async def login(request: Any) -> Any:
+        now = time.monotonic()
+        for key in list(runtime.login_attempts):
+            runtime.login_attempts[key] = [
+                at for at in runtime.login_attempts[key] if now - at < 60
+            ]
+            if not runtime.login_attempts[key]:
+                del runtime.login_attempts[key]
+        remote = request.remote or "unknown"
+        attempts = runtime.login_attempts.setdefault(remote, [])
+        if len(attempts) >= 5 or len(runtime.login_attempts) > 1024:
+            raise web.HTTPTooManyRequests(text="尝试次数过多，请一分钟后重试")
+        attempts.append(now)
+        body = await request.json()
+        password = body.get("password", "")
+        if not isinstance(password, str) or not hmac.compare_digest(
+            hashlib.sha256(password.encode()).digest(),
+            hashlib.sha256(
+                runtime.config.web.admin_password.encode()
+            ).digest(),
+        ):
+            raise web.HTTPUnauthorized(text="管理密码不正确")
+        runtime.sessions.pop(request.cookies.get("wr_admin", ""), None)
+        if len(runtime.sessions) >= 128:
+            runtime.sessions.pop(next(iter(runtime.sessions)))
+        sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        runtime.sessions[sid] = {"csrf": csrf, "expires": now + 8 * 3600}
+        response = web.json_response({"csrf": csrf})
+        response.set_cookie(
+            "wr_admin",
+            sid,
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+            max_age=8 * 3600,
+        )
+        return response
+
+    async def logout(request: Any) -> Any:
+        runtime.sessions.pop(request.cookies.get("wr_admin", ""), None)
+        response = web.json_response({"ok": True})
+        response.del_cookie(
+            "wr_admin", secure=True, httponly=True, samesite="Strict"
+        )
+        return response
+
+    async def status(request: Any) -> Any:
+        return web.json_response(
+            {
+                **runtime.public_status(),
+                "csrf": request["admin_session"]["csrf"],
+            }
+        )
+
+    async def qr_start(request: Any) -> Any:
+        await runtime.start_login()
+        return web.json_response({"ok": True}, status=202)
+
+    async def qr_cancel(request: Any) -> Any:
+        async with runtime.change_lock:
+            await runtime.cancel_login()
+        return web.json_response({"ok": True})
+
+    async def qr_image(request: Any) -> Any:
+        flow = runtime.flow
+        if (
+            not flow
+            or request.query.get("id") != flow.id
+            or not flow.uid
+            or flow.status not in {"waiting", "otp"}
+            or time.monotonic() >= flow.deadline
+        ):
+            raise web.HTTPNotFound(text="二维码已失效")
+        url = (
+            WEREAD_ORIGIN
+            + "/web/confirm?uid="
+            + urllib.parse.quote(flow.uid, safe="")
+        )
+        output = io.BytesIO()
+        qrcode.make(
+            url, image_factory=qrcode.image.svg.SvgPathImage, border=4
+        ).save(output)
+        return web.Response(
+            body=output.getvalue(), content_type="image/svg+xml"
+        )
+
+    async def qr_otp(request: Any) -> Any:
+        data = await request.json()
+        flow = runtime.flow
+        if (
+            not flow
+            or data.get("id") != flow.id
+            or flow.status != "otp"
+            or time.monotonic() >= flow.deadline
+        ):
+            raise web.HTTPConflict(text="验证码会话已变化，请刷新二维码")
+        otp = data.get("otp", "")
+        if not isinstance(otp, str) or not re.fullmatch(r"[0-9]{4}", otp):
+            raise web.HTTPBadRequest(text="请输入四位数字验证码")
+        flow.otp = otp
+        flow.status = "waiting"
+        flow.otp_ready.set()
+        return web.json_response({"ok": True})
+
+    async def books(request: Any) -> Any:
+        if not runtime.store.state["account"] or runtime.store.state.get(
+            "needs_login"
+        ):
+            raise QRServiceError("请先完成微信扫码登录")
+        client = runtime.client()
+        try:
+            return web.json_response({"books": await client.shelf()})
+        finally:
+            await client.close()
+
+    async def book_select(request: Any) -> Any:
+        body = await request.json()
+        book_id = body.get("id")
+        if not isinstance(book_id, str) or not re.fullmatch(
+            r"[0-9]{1,30}", book_id
+        ):
+            raise web.HTTPBadRequest(text="书籍标识不正确")
+        await runtime.select_book(book_id)
+        return web.json_response({"ok": True})
+
+    async def health(request: Any) -> Any:
+        return web.json_response({"status": "ok"})
+
+    app.add_routes(
+        [
+            web.get("/", page),
+            web.get("/healthz", health),
+            web.post("/api/session", login),
+            web.delete("/api/session", logout),
+            web.get("/api/status", status),
+            web.post("/api/qr", qr_start),
+            web.delete("/api/qr", qr_cancel),
+            web.get("/api/qr/image", qr_image),
+            web.post("/api/qr/otp", qr_otp),
+            web.get("/api/books", books),
+            web.post("/api/book", book_select),
+        ]
+    )
+    return app
 
 
 def load_run_history(history_file: Union[str, Path]) -> List[dict]:
@@ -4619,6 +6204,29 @@ def _validate_runtime_config(config: WeReadConfig):
         raise _config_error(
             "daemon.enabled", "daemon 模式下必须为 true", False
         )
+    if config.auth.mode == "qr":
+        if not config.auth.state_file or Path(config.auth.state_file).suffix.lower() != ".json":
+            raise ConfigError("auth.state_file 必须是 JSON 文件路径")
+        if Path(config.auth.state_file).resolve() == Path(config.history.file).resolve():
+            raise ConfigError("auth.state_file 不能与 history.file 相同")
+        if len(config.web.admin_password) < 16:
+            raise ConfigError("扫码模式需要设置至少 16 字符的 WEB_ADMIN_PASSWORD")
+        try:
+            url = urllib.parse.urlsplit(config.web.public_url)
+            if (url.scheme != "https" or not url.hostname or url.username or url.password
+                    or url.path not in ("", "/") or url.query or url.fragment):
+                raise ValueError()
+            port = url.port
+            host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname
+            config.web.public_url = "https://" + host + (f":{port}" if port and port != 443 else "")
+            ZoneInfo(config.schedule.timezone or "Asia/Shanghai")
+            if config.startup_mode == "scheduled":
+                if croniter is None:
+                    raise ConfigError("缺少依赖 croniter，请安装 requirements.txt")
+                croniter(config.schedule.cron_expression)
+        except (ValueError, KeyError):
+            raise ConfigError("请检查 web.public_url（必须为 HTTPS 站点根地址）、时区和定时表达式") from None
+        return
     validation_errors = []
     allowed_override_keys = ", ".join(USER_READING_OVERRIDE_FIELDS.keys())
 
@@ -4974,8 +6582,12 @@ async def main() -> int:
         _validate_runtime_config(config)
 
         # 验证CURL配置（早期验证）
-        await _validate_curl_configs(config)
-        curl_validated = True
+        if config.auth.mode == "curl":
+            await _validate_curl_configs(config)
+            curl_validated = True
+        else:
+            config.users = []
+            logging.info("扫码模式：离线配置检查通过，不校验线上凭据")
 
         # 打印启动信息
         logging.info("\n" + config.get_startup_info())
@@ -4992,6 +6604,9 @@ async def main() -> int:
         if args.validate_config or args.dry_run:
             logging.info("🧪 诊断模式结束，未启动阅读会话")
             return 0
+
+        if config.auth.mode == "qr" and (web is None or qrcode is None):
+            raise ConfigError("扫码模式缺少 aiohttp 或 qrcode，请安装 requirements.txt")
 
         # 创建并运行应用程序
         run_started = True

@@ -8,6 +8,7 @@ tmp*
 logs/
 
 config.yaml
+data/
 
 # C extensions
 *.so
